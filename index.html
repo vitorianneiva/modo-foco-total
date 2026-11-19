@@ -348,7 +348,11 @@ const ptLabel = v => v ? `+${fmt(v)} pt${v === 1 ? '' : 's'}` : '0 pts';
 const isFuture = i => i > todayIndex();
 
 /* ---------- persistence ---------- */
-let mode = 'loading', dbCol = null;
+const SUPABASE_URL = 'https://ezdujiiumzdhhisahwpr.supabase.co';
+const SUPABASE_ANON_KEY = 'COLE_AQUI_A_SUA_PUBLISHABLE_KEY';
+const SB_TABLE = 'modo_foco_days';
+
+let mode = 'loading';
 const pendingKeys = new Set(), timers = {}, writing = {}, dirty = {};
 const LS_KEY = 'modoFocoTotal.v1';
 const statusEl = document.getElementById('status');
@@ -357,25 +361,68 @@ function setStatus(cls, txt){ statusEl.className = 'status ' + cls; statusEl.que
 function lsLoad(){ try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); } catch(e){ return {}; } }
 function lsSave(){ try { localStorage.setItem(LS_KEY, JSON.stringify(state.days)); } catch(e){} }
 
+function sbHeaders(prefer){
+  const h = {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+    'Content-Type': 'application/json'
+  };
+  if (prefer) h['Prefer'] = prefer;
+  return h;
+}
+
+function rowToDay(r){
+  return Object.assign(blank(), {
+    m: Number(r.m) || 0,
+    a: Number(r.a) || 0,
+    cOn: Number(r.c_on) || 0,
+    cMin: Number(r.c_min) || 0,
+    kcal: Number(r.kcal) || 0,
+    ml: Number(r.ml) || 0,
+    obs: r.obs || ''
+  });
+}
+
+function dayToRow(key, d){
+  return {
+    key,
+    m: d.m ? 1 : 0,
+    a: d.a ? 1 : 0,
+    c_on: d.cOn ? 1 : 0,
+    c_min: Number(d.cMin) || 0,
+    kcal: Number(d.kcal) || 0,
+    ml: Number(d.ml) || 0,
+    obs: String(d.obs || ''),
+    updated_at: new Date().toISOString()
+  };
+}
+
 function scheduleSave(key, delay){
   pendingKeys.add(key);
   clearTimeout(timers[key]);
-  setStatus('busy','Salvando…');
+  setStatus('busy','Salvando...');
   timers[key] = setTimeout(() => { timers[key] = null; flush(key); }, delay);
 }
+
 async function flush(key){
-  if (mode !== 'db') { lsSave(); if (!timers[key]) pendingKeys.delete(key); setStatus('warn','Salvo só neste navegador'); return; }
+  lsSave();
+  if (mode !== 'cloud') {
+    if (!timers[key]) pendingKeys.delete(key);
+    setStatus('warn','Salvo só neste navegador');
+    return;
+  }
   if (writing[key]) { dirty[key] = true; return; }
   writing[key] = true;
   try {
-    await dbCol.doc(key).set(Object.assign({}, getDay(key)));
-    setStatus('ok','Tudo salvo');
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?on_conflict=key`, {
+      method: 'POST',
+      headers: sbHeaders('resolution=merge-duplicates,return=minimal'),
+      body: JSON.stringify(dayToRow(key, getDay(key)))
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    setStatus('ok','Tudo salvo na nuvem');
   } catch(e){
-    if (e && e.code === 'unavailable') {
-      await new Promise(r => setTimeout(r, 800 + Math.random()*800));
-      try { await dbCol.doc(key).set(Object.assign({}, getDay(key))); setStatus('ok','Tudo salvo'); }
-      catch(e2){ setStatus('warn','Não foi possível salvar agora'); }
-    } else setStatus('warn','Não foi possível salvar');
+    setStatus('warn','Sem ligação à nuvem (guardado localmente)');
   }
   writing[key] = false;
   if (dirty[key]) { dirty[key] = false; return flush(key); }
@@ -390,6 +437,33 @@ function useLocal(msg){
 }
 
 async function initDb(){
+  state.days = lsLoad();
+  renderAll();
+  if (!SUPABASE_URL.startsWith('https://') || !SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith('COLE_AQUI')) {
+    return useLocal('Salvo só neste navegador');
+  }
+  mode = 'cloud';
+  setStatus('busy','A sincronizar com a nuvem...');
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?select=*`, {
+      headers: sbHeaders()
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = await res.json();
+    if (Array.isArray(rows)) {
+      rows.forEach(r => {
+        if (r && r.key && !pendingKeys.has(r.key)) {
+          state.days[r.key] = rowToDay(r);
+        }
+      });
+      lsSave();
+    }
+    setStatus('ok','Tudo salvo na nuvem');
+    renderAll();
+  } catch(e){
+    setStatus('warn','Não foi possível sincronizar agora');
+  }
+}{
   if (!window.claude || typeof window.claude.use !== 'function') return useLocal('Salvo só neste navegador');
   let db = null, user = null;
   try { [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]); } catch(e){}
